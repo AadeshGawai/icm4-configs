@@ -1,0 +1,1110 @@
+#!/bin/sh
+
+# fwupdate
+#
+# Utility to verify and/or update the entire ICM4 system firmware from a LTI firmware update tarball.
+# Capable of updating: Main Linux FIT image, flash boot loaders and IO microcontroller boot loader and main firmware.
+#
+# Copyright (C) 2022 Loram Technologies, Inc. - All Rights Reserved
+# Proprietary and confidential. Unauthorized copying of this file, via any medium is strictly prohibited.
+
+########################################################################################################################
+# System dependencies
+
+# Busybox Commands(Standard Linux):
+# echo, getopt, mktemp, mkdir, mountpoint, umount, rm, tar, md5sum, awk, mount,
+# grep, cmp, stat, dd, date, find, install, dc
+
+# Additional Commands:
+# fsck.ext4, flash_erase, jq
+
+# LTI Proprietary Commands:
+# ioutil
+
+########################################################################################################################
+# Global shell setup
+
+# Exit if an undeclared variable is used
+set -o nounset
+
+########################################################################################################################
+# Exit codes
+EXIT_OK=0       # All good
+EXIT_VERIFY=1   # One or more of the firmware blocks failed verification
+EXIT_CMD=2      # Problem parsing command line opts
+EXIT_MANIFEST=3 # Problem extracting tarball or verifying the manifest contents
+EXIT_DEVICE=4   # Failure accessing the partitions, flash devices or io controller
+
+########################################################################################################################
+# Constants
+VERSION="1.0"
+
+BOOT_1_DEV="/dev/mmcblk0p1"
+BOOT_2_DEV="/dev/mmcblk0p2"
+FLASH_1_DEV="/dev/mtd0"
+FLASH_2_DEV="/dev/mtd1"
+IO_DEV="/dev/ttyS5"
+
+MANIFEST_FILENAME="manifest"
+MANIFEST_SECTION_LINUX="Linux"
+MANIFEST_SECTION_FLASH_1="Flash_1"
+MANIFEST_SECTION_FLASH_2="Flash_2"
+MANIFEST_SECTION_IO_MAIN="IO-Main"
+MANIFEST_SECTION_IO_BOOT="IO-Boot"
+
+INSTALLED_FILENAME_LINUX="firmware.itb"
+INSTALLED_FILENAME_HASH="firmware.hash"
+
+MOUNT_BOOT_OPTS="defaults,noatime,nodiratime,async,barrier=1,data=ordered,nodev,noexec"
+
+SPI_FLASH_ERASE_BLOCK_SIZE=4096
+
+########################################################################################################################
+# Global Variables - Needed by the exit cleanup handler
+g_temp_dir=""
+g_device_mount_dir=""
+
+########################################################################################################################
+usage()
+{
+	echo "Usage: fwupdate --model MODEL --gen GEN [ --verify ] [ --help ] [ --version ] [ --io ] [ --io-only ] filename"
+	echo "	--model MODEL : The model name of the equipment on which the firmware is being installed"
+	echo "	--gen GEN     : The hardware generation of the equipment on which the firmware is being installed"
+	echo "	--verify      : Verify only mode, no firmware is installed"
+	echo "	--io          : In addition to main firmware, install/verify IO controller firmware"
+	echo "	--io-only     : Only install/verify the IO controller firmware"
+	echo "	--help        : Display usage info and exit"
+	echo "	--version     : Display fwupdate version and exit"
+	echo "	filename      : File containing the firmware update to install/verify. Must be in tar.gz format"
+
+	exit ${EXIT_CMD}
+}
+
+########################################################################################################################
+# Parses command line opts and directs the verification / installation of the specified firmware.
+# Parameters: None
+# Return code: Does not return | Exit on error
+main()
+{
+	# Command line args
+	local cmd_args=""
+	local cmd_device_model=""
+	local cmd_device_generation=""
+	local cmd_firmware_tarball_filename=""
+	local cmd_verify_only_mode=0
+	local cmd_io_mode=0
+	local cmd_io_only_mode=0
+
+	# Extracted tarball file names and related
+	local tarball_extract_dir=""
+	local extracted_path_filename_manifest=""
+	local extracted_path_filename_linux=""
+	local extracted_path_filename_flash_1=""
+	local extracted_path_filename_flash_2=""
+	local extracted_path_filename_io_main=""
+	local extracted_path_filename_io_boot=""
+
+	# Others
+	local return_value=0
+	local fail_message=""
+	local skip_message=""
+	local updated_message=""
+	local verified_message=""
+	local install_boot_reverse_order=0
+
+	####################################################################################################################
+	# Process command line arguments
+	cmd_args=$(getopt -n fwupdate -o "" -l model:,gen:,verify,help,version,io,io-only -- "$@")
+	if [[ $? -ne 0 ]]; then
+		usage
+	fi
+
+	eval set -- "${cmd_args}"
+	while true; do
+		case "${1}" in
+			--model)
+				cmd_device_model="${2}"
+				shift 2
+				;;
+			--gen)
+				cmd_device_generation="${2}"
+				shift 2
+				;;
+			--verify)
+				cmd_verify_only_mode=1
+				shift
+				;;
+			--io)
+				cmd_io_mode=1
+				shift
+				;;
+			--io-only)
+				cmd_io_only_mode=1
+				shift
+				;;
+			--help)
+				usage
+				;;
+			--version)
+				echo "Version: ${VERSION}"
+				exit "${EXIT_OK}"
+				;;
+			--)
+				# end of the arguments; break out of the while loop
+				shift
+				break
+				;;
+			*)
+				echo "Unexpected option: ${1} - this should not happen."
+				usage
+				;;
+		esac
+	done
+
+	cmd_firmware_tarball_filename="${1:-}"
+
+	# Verify required arguments are available
+	if [[ -z "${cmd_device_model}" || -z "${cmd_device_generation}" || -z "${cmd_firmware_tarball_filename}" ]]; then
+		echo "Error: Must specify: Model, Generation and Firmware File Name"
+		usage
+	fi
+
+	# If io-only mode is selected then also enable io mode
+	if [[ "${cmd_io_only_mode}" -eq 1 ]]; then
+		cmd_io_mode=1
+	fi
+
+	####################################################################################################################
+	# Install trap handler to cleanup on exit
+	trap on_exit EXIT
+
+	####################################################################################################################
+	# Setup temp dir used to extract tarball
+	echo "**** Setting up a temp directory to use for installation ****"
+
+	# Make temp directory
+	g_temp_dir=$(mktemp -d -t fwupdate-XXXXXXXX)
+	if [[ $? -ne 0 || ! -d "${g_temp_dir}" ]]; then
+		echo "Could not make temp directory"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+	echo "dir = ${g_temp_dir}"
+
+	# Setup temp mount point
+	g_device_mount_dir="${g_temp_dir}/mnt"
+
+	mkdir -p "${g_device_mount_dir}"
+	if [[ $? -ne 0 || ! -d "${g_device_mount_dir}" ]]; then
+		echo "Could not create mount point dir"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+
+	# Setup temp tar extraction dir
+	tarball_extract_dir="${g_temp_dir}/img"
+
+	mkdir -p "${tarball_extract_dir}"
+	if [[ $? -ne 0 || ! -d "${tarball_extract_dir}" ]]; then
+		echo "Could not create tar extraction dir"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+
+	####################################################################################################################
+	# Extract firmware update tarball
+	echo -e "\n**** Extracting firmware update tarball ${cmd_firmware_tarball_filename} into ${tarball_extract_dir} ****"
+
+	tar -xvf "${cmd_firmware_tarball_filename}" -C "${tarball_extract_dir}/"
+	if [[ $? -ne 0  ]]; then
+		echo "Could not extract tar archive"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+
+	####################################################################################################################
+	# Verify hardware model and generation against manifest and extract filenames
+	extracted_path_filename_manifest="${tarball_extract_dir}/${MANIFEST_FILENAME}"
+
+	echo -e "\n**** Verifying hardware model and generation against extracted manifest ${extracted_path_filename_manifest} ****"
+
+	# Model
+	echo "Verifying hardware model ${cmd_device_model}"
+	if $(jq -e "if (.Model != \"${cmd_device_model}\") then true else false end" "${extracted_path_filename_manifest}"); then
+		echo "This firmware tarball is not supported on this hardware model"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+	echo "Hardware model supported"
+
+	# Generation
+	echo -e "\nVerifying hardware generation ${cmd_device_generation}"
+	if $(jq -r -e ".Generation | any(. != ${cmd_device_generation})" "${extracted_path_filename_manifest}"); then
+		echo "This firmware tarball is not supported on this hardware generation"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+	echo "Hardware generation supported"
+
+	# Only need these filenames if we are installing/verifying main firmware
+	if [[ "${cmd_io_only_mode}" -eq 0 ]]; then
+		# Get Linux firmware file name from manifest
+		echo -e "\nGetting ${MANIFEST_SECTION_LINUX} filename from manifest"
+		extracted_path_filename_linux=$(get_manifest_filename "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_LINUX}" \
+															  "${tarball_extract_dir}")
+		if [[ $? -ne 0 ]]; then
+			echo "Could not get filename from manifest"
+			exit_pf "${EXIT_MANIFEST}"
+		fi
+		echo "Filename = ${extracted_path_filename_linux}"
+
+		# Get Flash 1 firmware file name from manifest
+		echo -e "\nGetting ${MANIFEST_SECTION_FLASH_1} filename from manifest"
+		extracted_path_filename_flash_1=$(get_manifest_filename "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_FLASH_1}" \
+																"${tarball_extract_dir}")
+		if [[ $? -ne 0 ]]; then
+			echo "Could not get filename from manifest"
+			exit_pf "${EXIT_MANIFEST}"
+		fi
+		echo "Filename = ${extracted_path_filename_flash_1}"
+
+		# Get Flash 2 firmware file name from manifest
+		echo -e "\nGetting ${MANIFEST_SECTION_FLASH_2} filename from manifest"
+		extracted_path_filename_flash_2=$(get_manifest_filename "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_FLASH_2}" \
+																"${tarball_extract_dir}")
+		if [[ $? -ne 0 ]]; then
+			echo "Could not get filename from manifest"
+			exit_pf "${EXIT_MANIFEST}"
+		fi
+		echo "Filename = ${extracted_path_filename_flash_2}"
+	fi
+
+	# Only need these filenames if we are installing/verifying IO firmware
+	if [[ "${cmd_io_mode}" -eq 1 ]]; then
+		# Get IO Main firmware file name from manifest
+		echo -e "\nGetting ${MANIFEST_SECTION_IO_MAIN} filename from manifest"
+		extracted_path_filename_io_main=$(get_manifest_filename "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_IO_MAIN}" \
+																"${tarball_extract_dir}")
+		if [[ $? -ne 0 ]]; then
+			echo "Could not get filename from manifest"
+			exit_pf "${EXIT_MANIFEST}"
+		fi
+		echo "Filename = ${extracted_path_filename_io_main}"
+
+		# Get IO Boot loader firmware file name from manifest
+		echo -e "\nGetting ${MANIFEST_SECTION_IO_BOOT} filename from manifest"
+		extracted_path_filename_io_boot=$(get_manifest_filename "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_IO_BOOT}" \
+																"${tarball_extract_dir}")
+		if [[ $? -ne 0 ]]; then
+			echo "Could not get filename from manifest"
+			exit_pf "${EXIT_MANIFEST}"
+		fi
+		echo "Filename = ${extracted_path_filename_io_boot}"
+	fi
+
+	####################################################################################################################
+	# Verify manifest contents
+	echo -e "\n**** Verifying hashes for firmware files from manifest ${extracted_path_filename_manifest} ****"
+
+	# Only do if we are installing/verifying main firmware
+	if [[ "${cmd_io_only_mode}" -eq 0 ]]; then
+		# Main firmware file
+		verify_manifest_file "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_LINUX}" "${extracted_path_filename_linux}"
+
+		# Flash 1 firmware file
+		verify_manifest_file "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_FLASH_1}" "${extracted_path_filename_flash_1}"
+
+		# Flash 2 firmware file
+		verify_manifest_file "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_FLASH_2}" "${extracted_path_filename_flash_2}"
+	fi
+
+	# Only do if we are installing/verifying IO firmware
+	if [[ "${cmd_io_mode}" -eq 1 ]]; then
+		# IO Main firmware file
+		verify_manifest_file "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_IO_MAIN}" "${extracted_path_filename_io_main}"
+
+		# IO Boot loader firmware file
+		verify_manifest_file "${extracted_path_filename_manifest}" "${MANIFEST_SECTION_IO_BOOT}" "${extracted_path_filename_io_boot}"
+	fi
+
+	####################################################################################################################
+	# Perform installation or verification
+	if [[ "${cmd_verify_only_mode}" -eq 1 ]]; then
+		################################################################################################################
+		# Verify only mode
+		echo -e "\n**** Verifying installed firmware against tarball ****"
+
+		return_value=0
+		verified_message="Verified:"
+		fail_message="Failed:"
+
+		# Only do if we are verifying main firmware
+		if [[ "${cmd_io_only_mode}" -eq 0 ]]; then
+			# Verify firmware on Boot_1
+			verify_boot_part "${BOOT_1_DEV}" "${extracted_path_filename_linux}"
+			case $? in
+				0) verified_message="${verified_message} Boot_1" ;;
+				1) return_value=1; fail_message="${fail_message} Boot_1" ;;
+			esac
+
+			# Verify firmware on Boot_2
+			verify_boot_part "${BOOT_2_DEV}" "${extracted_path_filename_linux}"
+			case $? in
+				0) verified_message="${verified_message} Boot_2" ;;
+				1) return_value=1; fail_message="${fail_message} Boot_2" ;;
+			esac
+
+			# Verify firmware on Flash_1
+			verify_flash_dev "${FLASH_1_DEV}" "${extracted_path_filename_flash_1}"
+			case $? in
+				0) verified_message="${verified_message} Flash_1" ;;
+				1) return_value=1; fail_message="${fail_message} Flash_1" ;;
+			esac
+
+			# Verify firmware on Flash_2
+			verify_flash_dev "${FLASH_2_DEV}" "${extracted_path_filename_flash_2}"
+			case $? in
+				0) verified_message="${verified_message} Flash_2" ;;
+				1) return_value=1; fail_message="${fail_message} Flash_2" ;;
+			esac
+		fi
+
+		# Only do if we are verifying IO firmware
+		if [[ "${cmd_io_mode}" -eq 1 ]]; then
+			# Verify IO controller main firmware
+			verify_io_dev "${IO_DEV}" "${extracted_path_filename_io_main}" "main"
+			case $? in
+				0) verified_message="${verified_message} IO_Main" ;;
+				1) return_value=1; fail_message="${fail_message} IO_Main" ;;
+			esac
+
+			# Verify IO controller boot loader
+			verify_io_dev "${IO_DEV}" "${extracted_path_filename_io_boot}" "boot"
+			case $? in
+				0) verified_message="${verified_message} IO_Boot" ;;
+				1) return_value=1; fail_message="${fail_message} IO_Boot" ;;
+			esac
+		fi
+
+		if [[ "${return_value}" -ne 0 ]]; then
+			echo -e "\nAt least one firmware image failed verification, see output above for more info"
+			exit_pf "${EXIT_VERIFY}" "${verified_message}\n${fail_message}"
+		fi
+
+		exit_pf "${EXIT_OK}" "${verified_message}\n${fail_message}"
+	else
+		################################################################################################################
+		# Installation mode
+		echo -e "\n**** Installing firmware from tarball ****"
+
+		return_value=0
+		updated_message="Updated:"
+		skip_message="Skipped:"
+		fail_message="Failed:"
+		install_boot_reverse_order=0
+
+		# Only do if we are installing main firmware
+		if [[ "${cmd_io_only_mode}" -eq 0 ]]; then
+			# Test boot_ 1 partition, if bad do it first
+			test_boot_part "${BOOT_1_DEV}"
+			if [[ $? -ne 0 ]]; then
+				install_boot_reverse_order=1
+
+				install_boot_part "${BOOT_1_DEV}" "${extracted_path_filename_linux}"
+				case $? in
+					0) updated_message="${updated_message} Boot_1" ;;
+					1) return_value=1; fail_message="${fail_message} Boot_1" ;;
+					2) skip_message="${skip_message} Boot_1" ;;
+				esac
+			fi
+
+			# Install boot_2 partition
+			install_boot_part "${BOOT_2_DEV}" "${extracted_path_filename_linux}"
+			case $? in
+				0) updated_message="${updated_message} Boot_2" ;;
+				1) return_value=1; fail_message="${fail_message} Boot_2" ;;
+				2) skip_message="${skip_message} Boot_2" ;;
+			esac
+
+			# Install boot_1 partition if not installed above, due to being previously bad
+			if [[ "${install_boot_reverse_order}" -eq 0 ]]; then
+				install_boot_part "${BOOT_1_DEV}" "${extracted_path_filename_linux}"
+				case $? in
+					0) updated_message="${updated_message} Boot_1" ;;
+					1) return_value=1; fail_message="${fail_message} Boot_1" ;;
+					2) skip_message="${skip_message} Boot_1" ;;
+				esac
+			fi
+
+			# Install flash_2
+			install_flash_dev "${FLASH_2_DEV}" "${extracted_path_filename_flash_2}"
+			case $? in
+				0) updated_message="${updated_message} Flash_2" ;;
+				1) return_value=1; fail_message="${fail_message} Flash_2" ;;
+				2) skip_message="${skip_message} Flash_2" ;;
+			esac
+
+			# Install flash_1
+			install_flash_dev "${FLASH_1_DEV}" "${extracted_path_filename_flash_1}"
+			case $? in
+				0) updated_message="${updated_message} Flash_1" ;;
+				1) return_value=1; fail_message="${fail_message} Flash_1" ;;
+				2) skip_message="${skip_message} Flash_1" ;;
+			esac
+		fi
+
+		# Only do if we are installing IO firmware
+		if [[ "${cmd_io_mode}" -eq 1 ]]; then
+			# Install IO controller boot loader
+			install_io_dev "${IO_DEV}" "${extracted_path_filename_io_boot}" "boot"
+			case $? in
+				0) updated_message="${updated_message} IO_Boot" ;;
+				1) return_value=1; fail_message="${fail_message} IO_Boot" ;;
+				2) skip_message="${skip_message} IO_Boot" ;;
+			esac
+
+			# Install IO controller main firmware
+			install_io_dev "${IO_DEV}" "${extracted_path_filename_io_main}" "main"
+			case $? in
+				0) updated_message="${updated_message} IO_Main" ;;
+				1) return_value=1; fail_message="${fail_message} IO_Main" ;;
+				2) skip_message="${skip_message} IO_Main" ;;
+			esac
+		fi
+
+		if [[ "${return_value}" -ne 0 ]]; then
+			echo -e "\nAt least one firmware image failed installation, see output above for more info"
+			exit_pf "${EXIT_VERIFY}" "${updated_message}\n${skip_message}\n${fail_message}"
+		fi
+
+		exit_pf "${EXIT_OK}" "${updated_message}\n${skip_message}\n${fail_message}"
+	fi
+}
+
+########################################################################################################################
+# Exit trap cleanup handler.
+# Parameters: None
+# Return code: 0=Ok, 1=Error Occurred
+on_exit()
+{
+	local rv=0;
+
+	echo -e '\n**** Cleaning up...(remove tmp files, unmount devs, etc) ****'
+
+	# Unmount temp mount
+	if [[ -n "${g_device_mount_dir}" ]]; then
+		mountpoint -q "${g_device_mount_dir}"
+		if [[ $? -eq 0 ]]; then
+			echo "Unmounting temp mount point"
+			umount "${g_device_mount_dir}"
+			if [[ $? -ne 0 ]]; then
+				echo "Unable to unmount temp mount point"
+				rv=1
+			else
+				echo "Unmount ok"
+			fi
+		fi
+	fi
+
+	# Remove temp directory if it exists
+	if [[ -d "${g_temp_dir}" ]]; then
+		echo "Removing temp directory"
+		rm -rf "${g_temp_dir}"
+		if [[ $? -ne 0 ]]; then
+			echo "Unable to remove temp directory"
+			rv=1
+		else
+			echo "Removal ok"
+		fi
+	fi
+
+	# Remove the exit trap handler
+	trap - EXIT
+
+	return "${rv}"
+}
+
+########################################################################################################################
+# Perform cleanup and exit from program with exit code and optional message.
+# Parameters: $1=exit_code [$2=message]
+# Return code: Does not return | Exit always
+exit_pf()
+{
+	local exit_code="${1}"
+	local message="${2:-}"
+
+	# Perform exit cleanup
+	on_exit
+	local rv=$?
+
+	# if cleanup fails change exit code to indicate, if no code already specified
+	if [[ "${rv}" -ne 0 || "${exit_code}" -eq 0 ]]; then
+		exit_code="${rv}"
+	fi
+
+	# Display message if available
+	if [[ -n "${message}" ]]; then
+		echo -e "\n${message}"
+	fi
+
+	# Display a pass/fail message
+	if [[ "${exit_code}" -eq 0 ]]; then
+		echo -e "\nPASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS PASS\n"
+	else
+		echo -e "\nFAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL FAIL\n"
+	fi
+
+	exit "${exit_code}"
+}
+
+########################################################################################################################
+# Get the filename, with full path to extracted tarball location, from the manifest for a given section.
+# Parameters: $1=manifest_file, $2=manifest_section, $3=tarball_dir
+# Return code: 0=Ok, 1=Error Occurred
+get_manifest_filename()
+{
+	local manifest_file="${1}"
+	local manifest_section="${2}"
+	local tarball_dir="${3}"
+	local filename=""
+
+	filename=$(jq -r --arg JQARG_FILE "${manifest_section}" '.[$JQARG_FILE]."Name"' "${manifest_file}")
+	if [[ $? -ne 0 || "${filename}" == "null" ]]; then
+		return 1
+	fi
+	filename="${tarball_dir}/${filename}"
+
+	echo "${filename}"
+	return 0
+}
+
+########################################################################################################################
+# Verifies the hash of an extracted file matches the expected hash in the manifest.
+# Parameters: $1=manifest_file, $2=manifest_section, $3=extracted_filename
+# Return code: 0=Ok | Exit on error
+verify_manifest_file()
+{
+	local manifest_file="${1}"
+	local manifest_section="${2}"
+	local extracted_filename="${3}"
+	local hash=""
+	local md5=""
+
+	echo -e "\nVerifying manifest hash for ${manifest_section} against ${extracted_filename}"
+
+	# Get expected hash from manifest
+	echo "Getting hash from manifest"
+	hash=$(jq -r --arg JQARG_FILE "${manifest_section}" '.[$JQARG_FILE]."Hash"' "${manifest_file}")
+	if [[ $? -ne 0 || "${hash}" == "null" ]]; then
+		echo "Could not get hash from manifest"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+	echo "Manifest hash = ${hash}"
+
+	# Compute hash on extracted file
+	echo -e "\nComputing hash on file"
+	md5=$(md5sum "${extracted_filename}" | awk '{ print $1 }')
+	if [[ $? -ne 0 ]]; then
+		echo "Could not compute hash on file"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+	echo "File hash = ${md5}"
+
+	# Verify hashes match
+	echo -e "\nVerifying hashes match"
+	if [[ "${md5}" != "${hash}" ]]; then
+		echo "Hashes do not match"
+		exit_pf "${EXIT_MANIFEST}"
+	fi
+	echo "Hashes match"
+
+	return 0
+}
+
+########################################################################################################################
+# Verifies the firmware image on a given boot partition matches the one from the tarball and checks filesystem integrity
+# repairing the filesystem if needed.
+# Parameters: $1=dev_name $2=firmware_filename
+# Return code: 0=Ok, 1=Verify failed | Exit on error
+verify_boot_part()
+{
+	local dev_name="${1}"
+	local firmware_filename="${2}"
+	local rv=0
+
+	echo -e "\nVerifying boot partition: device=${dev_name} filename=${firmware_filename}"
+
+	# Check if device already mounted somewhere, if so unmount it
+	# Not the ideal way to do it, findnmt would be better but not available
+	mount | grep "${dev_name}" > /dev/null
+	if [[ $? -eq 0 ]]; then
+		echo -e "\nDevice already mounted, attempting to unmount"
+		umount "${dev_name}"
+		if [[ $? -ne 0 ]]; then
+			echo "Could not unmount device"
+			exit_pf "${EXIT_DEVICE}"
+		fi
+		echo "Unmount ok"
+	fi
+
+	# Verify boot device filesystem
+	echo -e "\nVerifying filesystem"
+	fsck.ext4 -y -v -C 0 "${dev_name}"
+	if [[ $? -gt 2 ]]; then
+		echo "File system check failed"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "File system ok"
+
+	# Mount boot device
+	echo -e "\nMounting filesystem"
+	mount -t ext4 -o "ro,${MOUNT_BOOT_OPTS}" "${dev_name}" "${g_device_mount_dir}"
+	if [[ $? -ne 0 ]]; then
+		echo "Could not mount boot device"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Mount ok"
+
+	# Verify installed firmware image and hash files
+	echo -e "\nVerifying firmware file"
+	cmp -s "${firmware_filename}" "${g_device_mount_dir}/${INSTALLED_FILENAME_LINUX}"
+	if [[ $? -eq 0 ]]; then
+		echo "Firmware matches"
+		(cd "${g_device_mount_dir}"; md5sum -c "${INSTALLED_FILENAME_HASH}")
+		if [[ $? -eq 0 ]]; then
+			echo "Hash matches"
+			rv=0
+		else
+			echo "Hash does not match, update needed"
+			rv=1
+		fi
+	else
+		echo "Firmware does not match, update needed"
+		rv=1
+	fi
+
+	# Umount boot device
+	echo -e "\nUnmounting filesystem"
+	umount "${dev_name}"
+	if [[ $? -ne 0 ]]; then
+		echo "Could not unmount device"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Unmount ok"
+
+	return "${rv}"
+}
+
+########################################################################################################################
+# Verifies the firmware image on a given flash device matches the one from the tarball.
+# Parameters: $1=dev_name $2=firmware_filename
+# Return code: 0=Ok, 1=Verify failed | Exit on error
+verify_flash_dev()
+{
+	local dev_name="${1}"
+	local firmware_filename="${2}"
+	local file_size=0
+	local rv=0
+
+	echo -e "\nVerifying flash device: device=${dev_name} filename=${firmware_filename}"
+
+	# Get firmware file size
+	echo -e "\nGetting file size"
+	file_size=$(stat -c %s "${firmware_filename}")
+	if [[ $? -ne 0 || "${file_size}" -eq 0 ]]; then
+		echo "Could not get file size"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "size = ${file_size}"
+
+	# Verify firmware image in flash device
+	echo -e "\nVerifying firmware image"
+	dd if="${dev_name}" count=1 bs="${file_size}" 2> /dev/null | cmp -s "${firmware_filename}"
+	if [[ $? -eq 0 ]]; then
+		echo "Image matches"
+		rv=0
+	else
+		echo "Image does not match, update needed"
+		rv=1
+	fi
+
+	return "${rv}"
+}
+
+########################################################################################################################
+# Verifies the firmware image on the IO controller section matches the one from the tarball.
+# Parameters: $1=dev_name $2=firmware_filename $3=section(main/boot)
+# Return code: 0=Ok, 1=Verify failed | Exit on error
+verify_io_dev()
+{
+	local dev_name="${1}"
+	local firmware_filename="${2}"
+	local section="${3}"
+	local rv=0
+
+	echo -e "\nVerifying io device: device=${dev_name} filename=${firmware_filename} section=${section}"
+
+	if [[ "${section}" != "main" && "${section}" != "boot" ]]; then
+		echo "Invalid section specified"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+
+	# Verify IO controller firmware for the specified section
+	# ioutil verifies existing firmware before installing, only updates it if needed
+	# ioutil return codes: 0=Ok, 1=Verify Failed, 2=Device Error
+	ioutil fwverify --dev "${dev_name}" --section "${section}" --filename "${firmware_filename}"
+	rv=$?
+	if [[ "${rv}" -ge 2 ]]; then
+		exit_pf "${EXIT_DEVICE}"
+	fi
+
+	return "${rv}"
+}
+
+########################################################################################################################
+# Tests the integrity of the given boot partition(repairing if needed) and checks if the hash of the firmware file
+# matches the one stored in the partition.
+# Parameters: $1=dev_name
+# Return code: 0=Ok, 1=Error
+test_boot_part()
+{
+	local dev_name="${1}"
+	local rv=0
+
+	echo -e "\nTesting boot partition: device=${dev_name}"
+
+	# Check if device already mounted somewhere, if so unmount it
+	# Not the ideal way to do it, findnmt would be better but not available
+	mount | grep "${dev_name}" > /dev/null
+	if [[ $? -eq 0 ]]; then
+		echo -e "\nDevice already mounted, attempting to unmount"
+		umount "${dev_name}"
+		if [[ $? -ne 0 ]]; then
+			echo "Could not unmount device"
+			return 1
+		fi
+		echo "Unmount ok"
+	fi
+
+	# Verify boot device filesystem
+	echo -e "\nVerifying filesystem"
+	fsck.ext4 -y -v -C 0 "${dev_name}"
+	if [[ $? -gt 2 ]]; then
+		echo "File system check failed"
+		return 1
+	fi
+	echo "File system ok"
+
+	# Mount boot device
+	echo -e "\nMounting filesystem"
+	mount -t ext4 -o "ro,${MOUNT_BOOT_OPTS}" "${dev_name}" "${g_device_mount_dir}"
+	if [[ $? -ne 0 ]]; then
+		echo "Could not mount boot device"
+		return 1
+	fi
+	echo "Mount ok"
+
+	# Verify installed firmware image and hash files
+	echo -e "\nVerifying firmware file"
+	(cd "${g_device_mount_dir}"; md5sum -c "${INSTALLED_FILENAME_HASH}")
+	if [[ $? -eq 0 ]]; then
+		echo "Hash matches"
+		rv=0
+	else
+		echo "Hash does not match"
+		rv=1
+	fi
+
+	# Umount boot device
+	echo -e "\nUnmounting filesystem"
+	umount "${dev_name}"
+	if [[ $? -ne 0 ]]; then
+		echo "Could not unmount device"
+		return 1
+	fi
+	echo "Unmount ok"
+
+	return "${rv}"
+}
+
+########################################################################################################################
+# Installs a firmware image on a given boot partition from the tarball and checks filesystem integrity repairing the
+# filesystem if needed. The currently installed image is first verified against the tarball image and only updated if
+# they differ.
+# Parameters: $1=dev_name $2=firmware_filename
+# Return code: 0=Ok, 1=Verify failed, 2=Skipped(Already up to date) | Exit on error
+install_boot_part()
+{
+	local dev_name="${1}"
+	local firmware_filename="${2}"
+	local rv=0
+	local start_time=0
+	local end_time=0
+
+	echo -e "\nInstalling boot partition: device=${dev_name} filename=${firmware_filename}"
+
+	# Check if device already mounted somewhere, if so unmount it
+	# Not the ideal way to do it, findnmt would be better but not available
+	mount | grep "${dev_name}" > /dev/null
+	if [[ $? -eq 0 ]]; then
+		echo -e "\nDevice already mounted, attempting to unmount"
+		umount "${dev_name}"
+		if [[ $? -ne 0 ]]; then
+			echo "Could not unmount device"
+			exit_pf "${EXIT_DEVICE}"
+		fi
+		echo "Unmount ok"
+	fi
+
+	# Verify boot device filesystem
+	echo -e "\nVerifying filesystem"
+	fsck.ext4 -y -v -C 0 "${dev_name}"
+	if [[ $? -gt 2 ]]; then
+		echo "File system check failed"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "File system ok"
+
+	# Mount boot device
+	echo -e "\nMounting filesystem"
+	mount -t ext4 -o "rw,${MOUNT_BOOT_OPTS}" "${dev_name}" "${g_device_mount_dir}"
+	if [[ $? -ne 0 ]]; then
+		echo "Could not mount boot device"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Mount ok"
+
+	# Check installed firmware image and hash files
+	echo -e "\nChecking firmware file"
+	cmp -s "${firmware_filename}" "${g_device_mount_dir}/${INSTALLED_FILENAME_LINUX}"
+	if [[ $? -eq 0 ]]; then
+		echo "Firmware matches"
+		(cd "${g_device_mount_dir}"; md5sum -c "${INSTALLED_FILENAME_HASH}")
+		if [[ $? -eq 0 ]]; then
+			echo "Hash matches, no need to update"
+			rv=2
+		else
+			echo "Hash does not match, update required"
+			rv=0
+		fi
+	else
+		echo "Firmware does not match, update required"
+		rv=0
+	fi
+
+	# Only need to install firmware if is is not already up to date
+	if [[ "${rv}" -ne 2 ]]; then
+		# Grab update start time, used to calculate how long the update takes
+		# Start of "Bricking Window"
+		start_time=$(date +"%s.%N")
+
+		# Remove all existing files from the partition
+		echo -e "\nRemoving existing files from partition"
+		find "${g_device_mount_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} \;
+		if [[ $? -ne 0 ]]; then
+			echo "Unable to remove files"
+			exit_pf "${EXIT_DEVICE}"
+		fi
+		echo "Removal ok"
+
+		# Install new firmware image file into partition
+		echo -e "\nInstalling firmware file into partition"
+		install -o root -g root -m 644 "${firmware_filename}" "${g_device_mount_dir}/${INSTALLED_FILENAME_LINUX}"
+		if [[ $? -ne 0 ]]; then
+			echo "Unable to install file"
+			exit_pf "${EXIT_DEVICE}"
+		fi
+		echo "Installation ok"
+
+		# Create hash file for image on partition
+		echo -e "\nCreating hash file"
+		(cd "${g_device_mount_dir}"; md5sum "${INSTALLED_FILENAME_LINUX}" > "${INSTALLED_FILENAME_HASH}")
+		if [[ $? -ne 0 ]]; then
+			echo "Unable to create hash"
+			exit_pf "${EXIT_DEVICE}"
+		fi
+		echo "Creation ok"
+
+		# Umount boot device, this will perform a sync
+		echo -e "\nUnmounting filesystem"
+		umount "${dev_name}"
+		if [[ $? -ne 0 ]]; then
+			echo "Could not unmount device"
+			exit_pf "${EXIT_DEVICE}"
+		fi
+		echo "Unmount ok"
+
+		# End of "Bricking Window"
+		# Display the time it took to update the firmware"
+		end_time=$(date +"%s.%N")
+		echo -e "\nUpdate took" $(echo "${end_time}" "${start_time}" -p | dc) "seconds"
+
+		# Remount boot device
+		echo -e "\nRemounting filesystem"
+		mount -t ext4 -o "ro,${MOUNT_BOOT_OPTS}" "${dev_name}" "${g_device_mount_dir}"
+		if [[ $? -ne 0 ]]; then
+			echo "Could not mount boot device"
+			exit_pf "${EXIT_DEVICE}"
+		fi
+		echo "Mount ok"
+
+		# Verify installed firmware image and hash files
+		echo -e "\nVerifying firmware file"
+		cmp -s "${firmware_filename}" "${g_device_mount_dir}/${INSTALLED_FILENAME_LINUX}"
+		if [[ $? -eq 0 ]]; then
+			echo "Firmware matches"
+			(cd "${g_device_mount_dir}"; md5sum -c "${INSTALLED_FILENAME_HASH}")
+			if [[ $? -eq 0 ]]; then
+				echo "Hash matches"
+				rv=0
+			else
+				echo "Hash does not match, installation failed"
+				rv=1
+			fi
+		else
+			echo "Firmware does not match, installation failed"
+			rv=1
+		fi
+	fi
+
+	# Umount boot device
+	echo -e "\nUnmounting filesystem"
+	umount "${dev_name}"
+	if [[ $? -ne 0 ]]; then
+		echo "Could not unmount device"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Unmount ok"
+
+	return "${rv}"
+}
+
+########################################################################################################################
+# Installs a firmware image on a given flash device from the tarball. The currently installed image is first verified
+# against the tarball image and only updated if they differ.
+# Parameters: $1=dev_name $2=firmware_filename
+# Return code: 0=Ok, 1=Verify failed, 2=Skipped(Already up to date) | Exit on error
+install_flash_dev()
+{
+	local dev_name="${1}"
+	local firmware_filename="${2}"
+	local file_size=0
+	local start_time=0
+	local flash_blocks=0
+	local end_time=0
+
+	echo -e "\nInstalling flash device: device=${dev_name} filename=${firmware_filename}"
+
+	# Make sure flash device is available
+	echo -e "\nTest for flash device"
+	if [[ ! -c "${dev_name}" ]]; then
+		echo "Flash device not available"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Flash device present"
+
+	# Get firmware file size
+	echo -e "\nGetting file size"
+	file_size=$(stat -c %s "${firmware_filename}")
+	if [[ $? -ne 0 || "${file_size}" -eq 0 ]]; then
+		echo "Could not get file size"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "File size = ${file_size}"
+
+	# Verify firmware image in flash device
+	echo -e "\nVerifying firmware image"
+	dd if="${dev_name}" count=1 bs="${file_size}" 2> /dev/null | cmp -s "${firmware_filename}"
+	if [[ $? -eq 0 ]]; then
+		echo "Image matches, no need to update"
+		return 2
+	fi
+	echo "Image does not match, update needed"
+
+	# Calculate the number of flash blocks that need to be erased, round up to nearest block
+	flash_blocks=$(( (file_size + SPI_FLASH_ERASE_BLOCK_SIZE - 1) / SPI_FLASH_ERASE_BLOCK_SIZE ))
+	if [[ $? -ne 0 || "${flash_blocks}" -eq 0 ]]; then
+		echo "Could not get flash blocks"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Flash Blocks = ${flash_blocks}"
+
+	# Grab update start time, used to calculate how long the update takes
+	# Start of "Bricking Window"
+	start_time=$(date +"%s.%N")
+
+	# Erase space for image on flash device
+	echo -e "\nErasing Flash"
+	flash_erase "${dev_name}" 0 "${flash_blocks}"
+	if [[ $? -ne 0 ]]; then
+		echo "Erase failed"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Erase ok"
+
+	# Write the image to the flash device, skip first 32 bytes
+	echo -e "\nFlashing image"
+	dd if="${firmware_filename}" of="${dev_name}" bs=32 seek=1 skip=1
+	if [[ $? -ne 0 ]]; then
+		echo "Flash failed"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Flash ok"
+
+	# Write the image header to the flash device
+	echo -e "\nFlashing image header"
+	dd if="${firmware_filename}" of="${dev_name}" bs=32 count=1
+	if [[ $? -ne 0 ]]; then
+		echo "Flash failed"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+	echo "Flash ok"
+
+	# End of "Bricking Window"
+	# Display the time it took to update the firmware
+	end_time=$(date +"%s.%N")
+	echo -e "\nUpdate took" $(echo "${end_time}" "${start_time}" -p | dc) "seconds"
+
+	# Verify firmware image in flash device
+	echo -e "\nVerifying flash image"
+	dd if="${dev_name}" count=1 bs="${file_size}" 2> /dev/null | cmp -s "${firmware_filename}"
+	if [[ $? -ne 0 ]]; then
+		echo "Image does not match, update failed"
+		return 1
+	else
+		echo "Image matches, update success"
+		return 0
+	fi
+}
+
+########################################################################################################################
+# Installs a firmware image on the IO controller section from the tarball. The currently installed image is first
+# verified against the tarball image and only updated if they differ.
+# Parameters: $1=dev_name $2=firmware_filename $3=section(main/boot)
+# Return code: 0=Ok, 1=Verify failed, 2=Skipped(Already up to date) | Exit on error
+install_io_dev()
+{
+	local dev_name="${1}"
+	local firmware_filename="${2}"
+	local section="${3}"
+	local rv=0
+
+	echo -e "\nInstalling io device: device=${dev_name} filename=${firmware_filename} section=${section}"
+
+	if [[ "${section}" != "main" && "${section}" != "boot" ]]; then
+		echo "Invalid section specified"
+		exit_pf "${EXIT_DEVICE}"
+	fi
+
+	# Install IO controller firmware for the specified section
+	# ioutil verifies existing firmware before installing, only updates it if needed
+	# ioutil return codes: 0=Ok, 1=Verify Failed, 2=Skipped(Already up to date), 3=Device Error
+	ioutil fwupdate --dev "${dev_name}" --section "${section}" --filename "${firmware_filename}"
+	rv=$?
+	if [[ "${rv}" -ge 3 ]]; then
+		exit_pf "${EXIT_DEVICE}"
+	fi
+
+	return "${rv}"
+}
+
+########################################################################################################################
+# Hand control over to main
+main "$@"
+
+# Should never get here
+exit_pf "${EXIT_OK}"

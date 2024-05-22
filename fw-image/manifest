@@ -1,0 +1,10 @@
+{
+	"Version": "%%LTI_IMAGE_VERSION%%",
+	"Model": "ICM4",
+	"Generation": [ 1 ],
+	"Linux": {"Name": "firmware.itb", "Hash": "xxx"},
+	"Flash_1": {"Name": "flash_1.bin", "Hash": "xxx"},
+	"Flash_2": {"Name": "flash_2.bin", "Hash": "xxx"},
+	"IO-Main": {"Name": "io-main.bin", "Hash": "4721c764cde07f83031bd5b6460d32c9"},
+	"IO-Boot": {"Name": "io-boot.bin", "Hash": "247a3b86e17ccd7264e57446182c5136"}
+}
